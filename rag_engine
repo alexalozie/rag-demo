@@ -1,131 +1,108 @@
 import os
-import shutil
 from pathlib import Path
 
-# LangChain Core & Chains
+# LangChain Core Utilities
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_classic.chains import create_retrieval_chain
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
-from langchain_classic.retrievers import EnsembleRetriever
 from langchain_core.prompts import ChatPromptTemplate
 
-# Loaders, Retrievers & Vector Stores
+# Ingestion Loaders
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
-from langchain_community.retrievers import BM25Retriever
-from langchain_chroma import Chroma
 
-# Stacks: Cloud (OpenAI) & Local (Ollama)
+# Vector Stores
+from langchain_community.vectorstores import Chroma
+
+# Stacks: Cloud (OpenAI)
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+
+# Stacks: Local (Ollama)
 from langchain_ollama import OllamaEmbeddings, ChatOllama
 
 # =====================================================================
 # ⚙️ CONFIGURATION BLOCK
 # =====================================================================
-STACK_MODE = "LOCAL"  # "CLOUD" (OpenAI) or "LOCAL" (Ollama)
+# Options: "CLOUD" (OpenAI) or "LOCAL" (Ollama)
+STACK_MODE = "LOCAL"  
+
+# Set your Cloud API key if running in CLOUD mode
+os.environ["OPENAI_API_KEY"] = "your-openai-api-key-here"
+
 DB_DIR = "./chroma_db_storage"
 DATA_DIR = "./source_documents"
-COLLECTION_NAME = "rag_demo_docs"
 # =====================================================================
-
 
 def setup_environment():
     """Ensures source directories exist and dummy data is generated."""
     Path(DATA_DIR).mkdir(exist_ok=True)
     sample_txt = Path(DATA_DIR) / "sample_policy.txt"
     if not sample_txt.exists():
-        sample_txt.write_text(
-            "Company remote work strategy updated in 2026: "
-            "Employees can work from any location globally for up to 90 days per calendar year. "
-            "The travel allowance program is managed by the Global Mobility Team led by Marcus Vance.",
-            encoding="utf-8",
-        )
-        print(f"📌 Created sample file in '{DATA_DIR}'.")
+        with open(sample_txt, "w", encoding="utf-8") as f:
+            f.write(
+                "Company remote work strategy updated in 2026: "
+                "Employees can work from any location globally for up to 90 days per calendar year. "
+                "The travel allowance program is managed by the Global Mobility Team led by Marcus Vance."
+            )
+        print(f"📌 Created a sample text file in '{DATA_DIR}' for demonstration.")
 
-
-def load_and_chunk_documents(directory: str):
-    """Loads TXT/PDF files and splits them into overlapping chunks."""
+def load_all_documents(directory):
+    """Dynamically parses all text and PDF files in the target folder."""
     documents = []
-    for file_path in Path(directory).iterdir():
-        suffix = file_path.suffix.lower()
-        if suffix == ".txt":
-            documents.extend(TextLoader(str(file_path), encoding="utf-8").load())
-        elif suffix == ".pdf":
-            documents.extend(PyPDFLoader(str(file_path)).load())
+    path = Path(directory)
+    
+    for file_path in path.iterdir():
+        if file_path.suffix.lower() == ".txt":
+            loader = TextLoader(str(file_path), encoding="utf-8")
+            documents.extend(loader.load())
+        elif file_path.suffix.lower() == ".pdf":
+            loader = PyPDFLoader(str(file_path))
+            documents.extend(loader.load())
+            
+    return documents
 
-    if not documents:
-        return []
-
-    splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=100)
-    return splitter.split_documents(documents)
-
-
-def initialize_components(mode: str):
-    """Initializes embeddings and LLM based on STACK_MODE."""
-    mode = mode.upper()
-    if mode == "CLOUD":
-        if not os.getenv("OPENAI_API_KEY"):
-            raise EnvironmentError("OPENAI_API_KEY is not set in your environment.")
+def initialize_components(mode):
+    """Initializes models and embedding pipelines depending on selected mode."""
+    if mode.upper() == "CLOUD":
         print("☁️ Initializing Cloud Stack (OpenAI)...")
-        return (
-            OpenAIEmbeddings(model="text-embedding-3-small"),
-            ChatOpenAI(model="gpt-4o-mini", temperature=0),
-        )
-    if mode == "LOCAL":
+        embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    elif mode.upper() == "LOCAL":
         print("💻 Initializing Local Stack (Ollama)...")
-        return (
-            OllamaEmbeddings(model="nomic-embed-text"),
-            ChatOllama(model="llama3.2", temperature=0, keep_alive="10m"),
-        )
-    raise ValueError("Invalid STACK_MODE. Choose 'CLOUD' or 'LOCAL'.")
-
-
-def build_hybrid_retriever(chunks, embeddings, rebuild_index: bool = False):
-    """Creates a BM25 + Chroma EnsembleRetriever without duplicating vectors."""
-    db_path = Path(DB_DIR)
-    if rebuild_index and db_path.exists():
-        shutil.rmtree(db_path)
-
-    # 1. Dense Vector Store (Load from disk if already indexed)
-    if db_path.exists() and any(db_path.iterdir()):
-        print(f"⚡ Loading existing Chroma index from '{DB_DIR}'...")
-        vector_store = Chroma(
-            collection_name=COLLECTION_NAME,
-            embedding_function=embeddings,
-            persist_directory=DB_DIR,
-        )
+        embeddings = OllamaEmbeddings(model="nomic-embed-text")
+        llm = ChatOllama(model="llama3.2", temperature=0)
     else:
-        print(f"💾 Embedding {len(chunks)} chunks into '{DB_DIR}'...")
-        vector_store = Chroma.from_documents(
-            documents=chunks,
-            embedding=embeddings,
-            collection_name=COLLECTION_NAME,
-            persist_directory=DB_DIR,
-        )
+        raise ValueError("Invalid STACK_MODE. Choose either 'CLOUD' or 'LOCAL'.")
+        
+    return embeddings, llm
 
-    dense_retriever = vector_store.as_retriever(search_kwargs={"k": 4})
-
-    # 2. Sparse Keyword Retriever (BM25)
-    bm25_retriever = BM25Retriever.from_documents(chunks)
-    bm25_retriever.k = 4
-
-    # 3. Combine via Reciprocal Rank Fusion (40% keyword, 60% semantic)
-    return EnsembleRetriever(
-        retrievers=[bm25_retriever, dense_retriever],
-        weights=[0.4, 0.6],
-    )
-
-
-def run_pipeline(rebuild_index: bool = False):
+def run_pipeline():
     setup_environment()
+    
+    # 1. Component Selection
     embeddings, llm = initialize_components(STACK_MODE)
-
-    chunks = load_and_chunk_documents(DATA_DIR)
-    if not chunks:
-        print("⚠️ No PDF or TXT files found in source directory.")
+    
+    # 2. Ingest & Chunk Document Data
+    print("📂 Ingesting local source directory documents...")
+    raw_docs = load_all_documents(DATA_DIR)
+    if not raw_docs:
+        print("⚠️ No files found in the source directory! Add a PDF or TXT file to run ingestion.")
         return
-
-    retriever = build_hybrid_retriever(chunks, embeddings, rebuild_index=rebuild_index)
-
+        
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=75)
+    split_chunks = text_splitter.split_documents(raw_docs)
+    print(f"✂️ Processed files into {len(split_chunks)} semantic chunks.")
+    
+    # 3. Vector Database Storage (Persistent Mode)
+    print(f"💾 Updating persistent Vector DB directory: {DB_DIR}")
+    vector_store = Chroma.from_documents(
+        documents=split_chunks, 
+        embedding=embeddings, 
+        persist_directory=DB_DIR
+    )
+    
+    # 4. Building Context-Aware Chain
+    retriever = vector_store.as_retriever(search_kwargs={"k": 2})
+    
     system_prompt = (
         "You are an expert system. Answer the user query using strictly "
         "the provided background context below. If the text does not contain "
@@ -136,21 +113,19 @@ def run_pipeline(rebuild_index: bool = False):
         ("system", system_prompt),
         ("human", "{input}"),
     ])
-
-    rag_chain = create_retrieval_chain(
-        retriever, create_stuff_documents_chain(llm, prompt)
-    )
-
+    
+    doc_combination_chain = create_stuff_documents_chain(llm, prompt)
+    rag_chain = create_retrieval_chain(retriever, doc_combination_chain)
+    
+    # 5. Execution Test
     user_query = "Who leads the travel allowance program and what is the limit on remote work?"
-    print(f"\n🚀 Dispatching query over {STACK_MODE} hybrid pipeline...")
+    print(f"\n🚀 Dispatching query over {STACK_MODE} pipeline...")
     result = rag_chain.invoke({"input": user_query})
-
+    
     print("\n================== RESULTS ==================")
     print(f"Question: {user_query}")
     print(f"Answer  : {result['answer']}")
     print("=============================================\n")
 
-
 if __name__ == "__main__":
-    # Set rebuild_index=True once whenever you add/edit files in source_documents
-    run_pipeline(rebuild_index=False)
+    run_pipeline()
