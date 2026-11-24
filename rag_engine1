@@ -1,0 +1,131 @@
+import os
+from pathlib import Path
+
+# LangChain Core Utilities
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_classic.chains import create_retrieval_chain
+from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate
+
+# Ingestion Loaders
+from langchain_community.document_loaders import PyPDFLoader, TextLoader
+
+# Vector Stores
+from langchain_community.vectorstores import Chroma
+
+# Stacks: Cloud (OpenAI)
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+
+# Stacks: Local (Ollama)
+from langchain_ollama import OllamaEmbeddings, ChatOllama
+
+# =====================================================================
+# ⚙️ CONFIGURATION BLOCK
+# =====================================================================
+# Options: "CLOUD" (OpenAI) or "LOCAL" (Ollama)
+STACK_MODE = "LOCAL"  
+
+# Set your Cloud API key if running in CLOUD mode
+os.environ["OPENAI_API_KEY"] = "your-openai-api-key-here"
+
+DB_DIR = "./chroma_db_storage"
+DATA_DIR = "./source_documents"
+# =====================================================================
+
+def setup_environment():
+    """Ensures source directories exist and dummy data is generated."""
+    Path(DATA_DIR).mkdir(exist_ok=True)
+    sample_txt = Path(DATA_DIR) / "sample_policy.txt"
+    if not sample_txt.exists():
+        with open(sample_txt, "w", encoding="utf-8") as f:
+            f.write(
+                "Company remote work strategy updated in 2026: "
+                "Employees can work from any location globally for up to 90 days per calendar year. "
+                "The travel allowance program is managed by the Global Mobility Team led by Marcus Vance."
+            )
+        print(f"📌 Created a sample text file in '{DATA_DIR}' for demonstration.")
+
+def load_all_documents(directory):
+    """Dynamically parses all text and PDF files in the target folder."""
+    documents = []
+    path = Path(directory)
+    
+    for file_path in path.iterdir():
+        if file_path.suffix.lower() == ".txt":
+            loader = TextLoader(str(file_path), encoding="utf-8")
+            documents.extend(loader.load())
+        elif file_path.suffix.lower() == ".pdf":
+            loader = PyPDFLoader(str(file_path))
+            documents.extend(loader.load())
+            
+    return documents
+
+def initialize_components(mode):
+    """Initializes models and embedding pipelines depending on selected mode."""
+    if mode.upper() == "CLOUD":
+        print("☁️ Initializing Cloud Stack (OpenAI)...")
+        embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    elif mode.upper() == "LOCAL":
+        print("💻 Initializing Local Stack (Ollama)...")
+        embeddings = OllamaEmbeddings(model="nomic-embed-text")
+        llm = ChatOllama(model="llama3.2", temperature=0)
+    else:
+        raise ValueError("Invalid STACK_MODE. Choose either 'CLOUD' or 'LOCAL'.")
+        
+    return embeddings, llm
+
+def run_pipeline():
+    setup_environment()
+    
+    # 1. Component Selection
+    embeddings, llm = initialize_components(STACK_MODE)
+    
+    # 2. Ingest & Chunk Document Data
+    print("📂 Ingesting local source directory documents...")
+    raw_docs = load_all_documents(DATA_DIR)
+    if not raw_docs:
+        print("⚠️ No files found in the source directory! Add a PDF or TXT file to run ingestion.")
+        return
+        
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=75)
+    split_chunks = text_splitter.split_documents(raw_docs)
+    print(f"✂️ Processed files into {len(split_chunks)} semantic chunks.")
+    
+    # 3. Vector Database Storage (Persistent Mode)
+    print(f"💾 Updating persistent Vector DB directory: {DB_DIR}")
+    vector_store = Chroma.from_documents(
+        documents=split_chunks, 
+        embedding=embeddings, 
+        persist_directory=DB_DIR
+    )
+    
+    # 4. Building Context-Aware Chain
+    retriever = vector_store.as_retriever(search_kwargs={"k": 2})
+    
+    system_prompt = (
+        "You are an expert system. Answer the user query using strictly "
+        "the provided background context below. If the text does not contain "
+        "the answer, say explicitly 'Information not found in database.'\n\n"
+        "Context:\n{context}"
+    )
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        ("human", "{input}"),
+    ])
+    
+    doc_combination_chain = create_stuff_documents_chain(llm, prompt)
+    rag_chain = create_retrieval_chain(retriever, doc_combination_chain)
+    
+    # 5. Execution Test
+    user_query = "Who leads the travel allowance program and what is the limit on remote work?"
+    print(f"\n🚀 Dispatching query over {STACK_MODE} pipeline...")
+    result = rag_chain.invoke({"input": user_query})
+    
+    print("\n================== RESULTS ==================")
+    print(f"Question: {user_query}")
+    print(f"Answer  : {result['answer']}")
+    print("=============================================\n")
+
+if __name__ == "__main__":
+    run_pipeline()
