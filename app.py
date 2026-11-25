@@ -1,3 +1,13 @@
+# --- SQLite3 Shim for ChromaDB on Streamlit Community Cloud (Linux) ---
+# Must run BEFORE importing streamlit, chromadb, or langchain modules.
+try:
+    __import__("pysqlite3")
+    import sys
+
+    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+except ImportError:
+    pass
+
 import os
 import shutil
 from pathlib import Path
@@ -43,11 +53,32 @@ RERANK_MODEL = "ms-marco-MiniLM-L-12-v2"
 st.set_page_config(page_title="Hybrid RAG Assistant", page_icon="🤖", layout="wide")
 
 
-def ensure_sample_data():
-    """Creates the data directory and sample policy file if empty."""
-    Path(DATA_DIR).mkdir(exist_ok=True)
-    sample_txt = Path(DATA_DIR) / "sample_policy.txt"
-    if not any(Path(DATA_DIR).iterdir()):
+def get_cloud_api_key() -> str:
+    """Safely checks Streamlit Cloud secrets first, then environment variables."""
+    try:
+        if "OPENAI_API_KEY" in st.secrets:
+            return st.secrets["OPENAI_API_KEY"]
+    except Exception:
+        pass
+    return os.getenv("OPENAI_API_KEY", "")
+
+
+def is_running_on_streamlit_cloud() -> bool:
+    """Detects Streamlit Community Cloud container environment or configured cloud secret."""
+    if os.path.exists("/mount/src"):
+        return True
+    try:
+        return "OPENAI_API_KEY" in st.secrets
+    except Exception:
+        return False
+
+
+def ensure_sample_data(allow_seed: bool = True):
+    """Creates the data directory and seeds sample data only on initial startup."""
+    data_path = Path(DATA_DIR)
+    data_path.mkdir(exist_ok=True)
+    if allow_seed and not any(f.is_file() for f in data_path.iterdir()):
+        sample_txt = data_path / "sample_policy.txt"
         sample_txt.write_text(
             "Company remote work strategy updated in 2026: "
             "Employees can work from any location globally for up to 90 days per calendar year. "
@@ -56,10 +87,24 @@ def ensure_sample_data():
         )
 
 
+def trigger_reindex():
+    """Clears persisted ChromaDB on disk and increments index_version to bust cache."""
+    db_path = Path(DB_DIR)
+    if db_path.exists():
+        shutil.rmtree(db_path)
+    st.session_state.index_version += 1
+
+
 def load_and_chunk_documents(directory: str):
     """Loads TXT and PDF files and splits them into overlapping chunks."""
     documents = []
-    for file_path in Path(directory).iterdir():
+    data_path = Path(directory)
+    if not data_path.exists():
+        return []
+
+    for file_path in sorted(data_path.iterdir()):
+        if not file_path.is_file():
+            continue
         suffix = file_path.suffix.lower()
         if suffix == ".txt":
             documents.extend(TextLoader(str(file_path), encoding="utf-8").load())
@@ -90,7 +135,6 @@ def get_models(stack_mode: str, api_key: str = ""):
 @st.cache_resource(show_spinner="Building hybrid BM25 + Chroma index...")
 def get_rag_chain(stack_mode: str, api_key: str, index_version: int):
     """Builds and caches the conversational hybrid RAG chain."""
-    ensure_sample_data()
     embeddings, llm, compressor = get_models(stack_mode, api_key)
 
     chunks = load_and_chunk_documents(DATA_DIR)
@@ -171,45 +215,120 @@ def extract_sources(context_docs):
     return formatted
 
 
+def stream_rag_response(rag_chain, user_query: str, lc_history: list, state_holder: dict):
+    """Yields answer tokens for st.write_stream() while capturing retrieved context docs."""
+    for chunk in rag_chain.stream({"input": user_query, "chat_history": lc_history}):
+        if "context" in chunk:
+            state_holder["context"] = chunk["context"]
+        if "answer" in chunk and chunk["answer"]:
+            yield chunk["answer"]
+
+
 # --- Session State Initialization ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "index_version" not in st.session_state:
     st.session_state.index_version = 0
+if "confirm_delete_all" not in st.session_state:
+    st.session_state.confirm_delete_all = False
+if "initial_seed_done" not in st.session_state:
+    ensure_sample_data(allow_seed=True)
+    st.session_state.initial_seed_done = True
 
-# --- Sidebar: Stack Settings & Document Upload ---
+# --- Sidebar: Stack Settings & File Manager ---
 with st.sidebar:
     st.header("⚙️ RAG Configuration")
-    stack_mode = st.selectbox("Model Stack", ["LOCAL", "CLOUD"], index=0)
+
+    cloud_env = is_running_on_streamlit_cloud()
+    default_index = 1 if cloud_env else 0  # Index 1 = "CLOUD", Index 0 = "LOCAL"
+
+    stack_mode = st.selectbox(
+        "Model Stack",
+        ["LOCAL", "CLOUD"],
+        index=default_index,
+        help="Auto-defaults to CLOUD when deployed on Streamlit Cloud.",
+    )
+
     api_key = ""
     if stack_mode == "CLOUD":
+        detected_key = get_cloud_api_key()
         api_key = st.text_input(
             "OpenAI API Key",
-            value=os.getenv("OPENAI_API_KEY", ""),
+            value=detected_key,
             type="password",
+            help="Loaded automatically from Streamlit Secrets if configured.",
         )
+        if detected_key and api_key == detected_key:
+            st.caption("🔐 Loaded `OPENAI_API_KEY` from Secrets/Environment.")
 
     st.divider()
-    st.subheader("📂 Knowledge Base")
+    st.subheader("📤 Upload Documents")
     uploaded_files = st.file_uploader(
-        "Upload PDF or TXT documents",
+        "Add PDF or TXT files",
         type=["pdf", "txt"],
         accept_multiple_files=True,
     )
 
-    if uploaded_files and st.button("Save & Re-index Documents", use_container_width=True):
+    if uploaded_files and st.button("Save & Re-index Uploads", use_container_width=True):
         Path(DATA_DIR).mkdir(exist_ok=True)
         for uf in uploaded_files:
             dest = Path(DATA_DIR) / uf.name
             dest.write_bytes(uf.getbuffer())
-        if Path(DB_DIR).exists():
-            shutil.rmtree(DB_DIR)
-        st.session_state.index_version += 1
-        st.success(f"Indexed {len(uploaded_files)} file(s)!")
+        st.session_state.confirm_delete_all = False
+        trigger_reindex()
+        st.rerun()
 
-    ensure_sample_data()
-    indexed_files = [f.name for f in Path(DATA_DIR).iterdir() if f.is_file()]
-    st.caption(f"**Active files ({len(indexed_files)}):** {', '.join(indexed_files)}")
+    st.divider()
+    st.subheader("🗂️ Indexed File Manager")
+    data_path = Path(DATA_DIR)
+    data_path.mkdir(exist_ok=True)
+    active_files = sorted(
+        [f for f in data_path.iterdir() if f.is_file() and f.suffix.lower() in {".pdf", ".txt"}]
+    )
+
+    if not active_files:
+        st.caption("No documents indexed. Upload a PDF or TXT file above.")
+    else:
+        for file_path in active_files:
+            size_kb = file_path.stat().st_size / 1024
+            col_name, col_del = st.columns([0.8, 0.2])
+            with col_name:
+                st.markdown(f"📄 **{file_path.name}**  \n`{size_kb:.1f} KB`")
+            with col_del:
+                if st.button(
+                    "🗑️",
+                    key=f"del_{file_path.name}",
+                    help=f"Delete {file_path.name} and re-index",
+                ):
+                    file_path.unlink(missing_ok=True)
+                    st.session_state.confirm_delete_all = False
+                    trigger_reindex()
+                    st.rerun()
+
+        # Two-Step Delete All Confirmation
+        if not st.session_state.confirm_delete_all:
+            if st.button(
+                "🗑️ Delete All Documents",
+                use_container_width=True,
+                help="Remove all files from the knowledge base",
+            ):
+                st.session_state.confirm_delete_all = True
+                st.rerun()
+        else:
+            st.warning(f"Delete all {len(active_files)} document(s) and wipe the vector index?")
+            c_yes, c_no = st.columns(2)
+            with c_yes:
+                if st.button("✅ Confirm", type="primary", use_container_width=True):
+                    for f in active_files:
+                        f.unlink(missing_ok=True)
+                    st.session_state.confirm_delete_all = False
+                    st.session_state.messages = []
+                    trigger_reindex()
+                    st.rerun()
+            with c_no:
+                if st.button("✖️ Cancel", use_container_width=True):
+                    st.session_state.confirm_delete_all = False
+                    st.rerun()
 
     st.divider()
     col1, col2 = st.columns(2)
@@ -219,9 +338,7 @@ with st.sidebar:
             st.rerun()
     with col2:
         if st.button("🔄 Rebuild DB", use_container_width=True):
-            if Path(DB_DIR).exists():
-                shutil.rmtree(DB_DIR)
-            st.session_state.index_version += 1
+            trigger_reindex()
             st.rerun()
 
 # --- Main Chat Area ---
@@ -229,12 +346,12 @@ st.title("🤖 Conversational Hybrid RAG")
 st.caption("BM25 + ChromaDB + FlashRank Cross-Encoder Re-Ranking")
 
 if stack_mode == "CLOUD" and not api_key:
-    st.warning("Enter your OpenAI API Key in the sidebar to run in CLOUD mode.")
+    st.warning("Enter your OpenAI API Key in the sidebar (or add `OPENAI_API_KEY` to Streamlit Cloud Secrets).")
     st.stop()
 
 rag_chain = get_rag_chain(stack_mode, api_key, st.session_state.index_version)
 if rag_chain is None:
-    st.info("Upload a PDF or TXT file in the sidebar to get started.")
+    st.info("Your knowledge base is empty. Upload a PDF or TXT file in the sidebar to begin.")
     st.stop()
 
 # Render existing chat history
@@ -247,13 +364,12 @@ for msg in st.session_state.messages:
                     st.markdown(f"**{src['title']}** — Relevance Score: `{src['score']}`")
                     st.caption(src["snippet"])
 
-# Handle new user input
+# Handle new user input with real-time token streaming
 if user_query := st.chat_input("Ask a question about your documents..."):
     st.session_state.messages.append({"role": "user", "content": user_query})
     with st.chat_message("user"):
         st.markdown(user_query)
 
-    # Convert UI messages into LangChain message history
     lc_history = []
     for m in st.session_state.messages[:-1][-(MAX_HISTORY_TURNS * 2) :]:
         if m["role"] == "user":
@@ -262,15 +378,12 @@ if user_query := st.chat_input("Ask a question about your documents..."):
             lc_history.append(AIMessage(content=m["content"]))
 
     with st.chat_message("assistant"):
-        with st.spinner("Contextualizing, retrieving & re-ranking..."):
-            result = rag_chain.invoke({
-                "input": user_query,
-                "chat_history": lc_history,
-            })
-            answer = result["answer"]
-            sources = extract_sources(result.get("context", []))
+        stream_state = {"context": []}
+        answer = st.write_stream(
+            stream_rag_response(rag_chain, user_query, lc_history, stream_state)
+        )
+        sources = extract_sources(stream_state["context"])
 
-        st.markdown(answer)
         if sources:
             with st.expander("📚 Retrieved Sources & FlashRank Scores"):
                 for src in sources:
